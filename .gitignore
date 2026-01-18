@@ -1,17 +1,20 @@
-# local config
-config.yaml
-
-# virtualenv
+# Python
 .venv/
-
-# python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# logs and outputs
+# Local config (keep example in repo)
+config.yaml
+
+# Outputs / runtime
+work/
 logs/
 *.log
-*.mp4
 
-# work dirs (frames/tmp/archive)
-work/
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
