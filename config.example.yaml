@@ -1,0 +1,64 @@
+data:
+  base_url: "https://sojpublicdata.blob.core.windows.net/jerseymet/"
+
+publish:
+  enabled: false
+  method: "scp"
+  scp:
+    key_path: ""
+    strict_host_key_checking: false
+    known_hosts_path: "~/.ssh/known_hosts"
+
+pipelines:
+  radar_live:
+    work_dir: "./work/radar_live"
+    log_file: "./logs/radar-live.log"
+    state_file: "./work/radar_live/last_digest.txt"
+
+    input_fps: 2
+
+    wide:
+      prefix: "Radar"
+      ext: ".JPG"
+      slots: 10
+      output_fps: 6
+      interpolate_mode: "mci"
+      out_file: "./work/radar_live/radar_wide.mp4"
+      remote_target: ""
+
+    zoom:
+      prefix: "Radarzoom"
+      ext: ".JPG"
+      slots: 10
+      output_fps: 8
+      interpolate_mode: "blend"
+      out_file: "./work/radar_live/radar_zoom.mp4"
+      remote_target: ""
+
+  radar_archive_24h:
+    work_dir: "./work/radar_archive_24h"
+    log_file: "./logs/radar-archive.log"
+
+    window_seconds: 86400
+
+    build_max_once_per_hour: true
+    last_built_hour_file: "./work/radar_archive_24h/last_built_hour.txt"
+
+    input_fps_24h: 4
+    output_fps_24h: 10
+
+    wide:
+      prefix: "Radar"
+      ext: ".JPG"
+      slots: 10
+      latest_token: "radar10"
+      out_file: "./work/radar_archive_24h/radar_24h_wide.mp4"
+      remote_target: ""
+
+    zoom:
+      prefix: "Radarzoom"
+      ext: ".JPG"
+      slots: 10
+      latest_token: "radarzoom10"
+      out_file: "./work/radar_archive_24h/radar_24h_zoom.mp4"
+      remote_target: ""

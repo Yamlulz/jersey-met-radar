@@ -1,0 +1,17 @@
+# local config
+config.yaml
+
+# virtualenv
+.venv/
+
+# python
+__pycache__/
+*.pyc
+
+# logs and outputs
+logs/
+*.log
+*.mp4
+
+# work dirs (frames/tmp/archive)
+work/

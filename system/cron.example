@@ -1,0 +1,2 @@
+*/2 * * * * flock -n /tmp/radar_live.lock python3 /path/to/repo/scripts/met_animator.py radar-live --config /path/to/repo/config.yaml >> /path/to/repo/logs/cron-radar-live.log 2>&1
+*/5 * * * * flock -n /tmp/radar_archive.lock python3 /path/to/repo/scripts/met_animator.py radar-archive-24h --config /path/to/repo/config.yaml >> /path/to/repo/logs/cron-radar-archive.log 2>&1

@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+import os
+import sys
+import time
+import shutil
+import hashlib
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
+
+import requests
+import yaml
+from argparse import ArgumentParser
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def load_yaml(path: Path) -> Dict[str, Any]:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        if not isinstance(data, dict):
+            die(f"Config root must be a map/dict: {path}")
+        return data
+    except FileNotFoundError:
+        die(f"Config file not found: {path}")
+    except Exception as e:
+        die(f"Failed to load config {path}: {e}")
+
+
+def resolve_path(config_dir: Path, p: str) -> Path:
+    p = os.path.expanduser(p)
+    path = Path(p)
+    if path.is_absolute():
+        return path
+    return (config_dir / path).resolve()
+
+
+def ensure_dir(p: Path) -> None:
+    p.mkdir(parents=True, exist_ok=True)
+
+
+def now_ts() -> str:
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def log_line(log_path: Path, msg: str) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line)
+    try:
+        ensure_dir(log_path.parent)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def sha256_bytes(b: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(b)
+    return h.hexdigest()
+
+
+def fetch_bytes(url: str, timeout: int = 20) -> bytes:
+    r = requests.get(url, timeout=timeout)
+    r.raise_for_status()
+    return r.content
+
+
+def write_bytes(path: Path, content: bytes) -> None:
+    ensure_dir(path.parent)
+    with path.open("wb") as f:
+        f.write(content)
+
+
+def read_text(path: Path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+def write_text(path: Path, text: str) -> None:
+    ensure_dir(path.parent)
+    path.write_text(text, encoding="utf-8")
+
+
+def run_cmd(cmd: List[str], log_path: Path) -> Tuple[bool, str]:
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        return True, out.decode(errors="ignore")
+    except subprocess.CalledProcessError as e:
+        return False, (e.output or b"").decode(errors="ignore")
+
+
+def scp_upload(
+    local_path: Path,
+    remote_target: str,
+    publish_cfg: Dict[str, Any],
+    log_path: Path,
+) -> bool:
+    enabled = bool(publish_cfg.get("enabled", False))
+    if not enabled:
+        log_line(log_path, f"Publish disabled; not uploading: {local_path.name}")
+        return False
+
+    method = str(publish_cfg.get("method", "scp")).lower()
+    if method != "scp":
+        log_line(log_path, f"Unsupported publish method '{method}'; not uploading.")
+        return False
+
+    scp_cfg = publish_cfg.get("scp", {}) or {}
+    key_path = str(scp_cfg.get("key_path", "")).strip()
+    strict = bool(scp_cfg.get("strict_host_key_checking", False))
+    known_hosts = str(scp_cfg.get("known_hosts_path", "~/.ssh/known_hosts"))
+
+    cmd = ["scp"]
+    if key_path:
+        cmd += ["-i", os.path.expanduser(key_path)]
+
+    if not strict:
+        cmd += ["-o", "StrictHostKeyChecking=no"]
+
+    cmd += ["-o", f"UserKnownHostsFile={os.path.expanduser(known_hosts)}"]
+    cmd += [str(local_path), remote_target]
+
+    log_line(log_path, f"Uploading via scp: {local_path} -> {remote_target}")
+    ok, out = run_cmd(cmd, log_path)
+    if ok:
+        log_line(log_path, "Upload OK")
+        return True
+    log_line(log_path, "Upload FAILED")
+    if out.strip():
+        log_line(log_path, out.strip())
+    return False
+
+
+def ffmpeg_build(
+    frames_dir: Path,
+    prefix: str,
+    ext: str,
+    input_fps: int,
+    output_fps: int,
+    interpolate_mode: str,
+    out_file: Path,
+    log_path: Path,
+) -> bool:
+    ensure_dir(out_file.parent)
+
+    pattern = str(frames_dir / f"{prefix}%02d{ext}")
+    mode = interpolate_mode.lower().strip()
+
+    if mode == "mci":
+        vf = (
+            f"minterpolate=fps={output_fps}:"
+            "mi_mode=mci:mc_mode=aobmc:me_mode=bidir"
+        )
+    else:
+        vf = f"minterpolate=fps={output_fps}:mi_mode=blend"
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-framerate", str(input_fps),
+        "-i", pattern,
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-pix_fmt", "yuv420p",
+        str(out_file),
+    ]
+
+    log_line(log_path, f"Running ffmpeg for {out_file.name}")
+    ok, out = run_cmd(cmd, log_path)
+    if ok:
+        log_line(log_path, f"Built: {out_file}")
+        return True
+
+    log_line(log_path, f"ffmpeg FAILED for {out_file.name}")
+    if out.strip():
+        log_line(log_path, out.strip())
+    return False
+
+
+def download_sequence(
+    base_url: str,
+    frames_dir: Path,
+    prefix: str,
+    ext: str,
+    slots: int,
+    log_path: Path,
+) -> Tuple[bool, str]:
+    """
+    Downloads prefix01..prefixNN into frames_dir.
+    Returns (any_changed, digest_of_all_files_bytes).
+    """
+    ensure_dir(frames_dir)
+
+    changed = False
+    digest_parts: List[str] = []
+
+    for i in range(1, slots + 1):
+        name = f"{prefix}{i:02d}{ext}"
+        url = base_url + name
+        dest = frames_dir / name
+
+        content = fetch_bytes(url)
+        digest_parts.append(sha256_bytes(content))
+
+        if not dest.exists():
+            write_bytes(dest, content)
+            log_line(log_path, f"Downloaded: {name}")
+            changed = True
+        else:
+            old = dest.read_bytes()
+            if old != content:
+                write_bytes(dest, content)
+                log_line(log_path, f"Updated: {name}")
+                changed = True
+
+    digest = "".join(digest_parts)
+    return changed, hashlib.sha256(digest.encode("utf-8")).hexdigest()
+
+
+def radar_live(config: Dict[str, Any], config_dir: Path, force: bool) -> int:
+    base_url = str(config["data"]["base_url"])
+    publish_cfg = config.get("publish", {}) or {}
+
+    pl = config["pipelines"]["radar_live"]
+    log_path = resolve_path(config_dir, pl["log_file"])
+    work_dir = resolve_path(config_dir, pl["work_dir"])
+    state_file = resolve_path(config_dir, pl["state_file"])
+    input_fps = int(pl.get("input_fps", 2))
+
+    wide = pl["wide"]
+    zoom = pl["zoom"]
+
+    wide_dir = work_dir / "wide_frames"
+    zoom_dir = work_dir / "zoom_frames"
+
+    log_line(log_path, "radar-live start")
+    ensure_dir(work_dir)
+
+    wide_changed, wide_digest = download_sequence(
+        base_url, wide_dir,
+        str(wide["prefix"]), str(wide["ext"]), int(wide["slots"]),
+        log_path
+    )
+    zoom_changed, zoom_digest = download_sequence(
+        base_url, zoom_dir,
+        str(zoom["prefix"]), str(zoom["ext"]), int(zoom["slots"]),
+        log_path
+    )
+
+    digest = hashlib.sha256((wide_digest + zoom_digest).encode("utf-8")).hexdigest()
+    old = read_text(state_file)
+
+    if (not force) and (digest == old):
+        log_line(log_path, "No new frames; skipping rebuild.")
+        return 0
+
+    write_text(state_file, digest)
+    log_line(log_path, "Change detected (or forced); rebuilding MP4s.")
+
+    out_wide = resolve_path(config_dir, wide["out_file"])
+    out_zoom = resolve_path(config_dir, zoom["out_file"])
+
+    ok_wide = ffmpeg_build(
+        frames_dir=wide_dir,
+        prefix=str(wide["prefix"]),
+        ext=str(wide["ext"]),
+        input_fps=input_fps,
+        output_fps=int(wide["output_fps"]),
+        interpolate_mode=str(wide.get("interpolate_mode", "mci")),
+        out_file=out_wide,
+        log_path=log_path,
+    )
+    ok_zoom = ffmpeg_build(
+        frames_dir=zoom_dir,
+        prefix=str(zoom["prefix"]),
+        ext=str(zoom["ext"]),
+        input_fps=input_fps,
+        output_fps=int(zoom["output_fps"]),
+        interpolate_mode=str(zoom.get("interpolate_mode", "blend")),
+        out_file=out_zoom,
+        log_path=log_path,
+    )
+
+    if ok_wide and str(wide.get("remote_target", "")).strip():
+        scp_upload(out_wide, str(wide["remote_target"]), publish_cfg, log_path)
+    if ok_zoom and str(zoom.get("remote_target", "")).strip():
+        scp_upload(out_zoom, str(zoom["remote_target"]), publish_cfg, log_path)
+
+    log_line(log_path, "radar-live done")
+    return 0
+
+
+def parse_archive_ts(fname: str) -> Optional[float]:
+    # "YYYYmmdd_HHMMSS_Radar10.JPG"
+    if len(fname) < 16:
+        return None
+    ts = fname[:15]
+    try:
+        tstruct = time.strptime(ts, "%Y%m%d_%H%M%S")
+        return time.mktime(tstruct)
+    except Exception:
+        return None
+
+
+def prune_archive_dir(archive_dir: Path, window_seconds: int, log_path: Path) -> None:
+    cutoff = time.time() - window_seconds
+    removed = 0
+    for p in archive_dir.iterdir():
+        if not p.is_file():
+            continue
+        ts = parse_archive_ts(p.name)
+        if ts is None:
+            continue
+        if ts < cutoff:
+            try:
+                p.unlink()
+                removed += 1
+            except Exception:
+                pass
+    if removed:
+        log_line(log_path, f"Pruned {removed} old files from {archive_dir}")
+
+
+def archive_snapshot(frames_dir: Path, archive_dir: Path, prefix: str, ext: str, slots: int, log_path: Path) -> None:
+    ensure_dir(archive_dir)
+    ts = now_ts()
+    for i in range(1, slots + 1):
+        name = f"{prefix}{i:02d}{ext}"
+        src = frames_dir / name
+        if src.exists():
+            dst = archive_dir / f"{ts}_{name}"
+            try:
+                shutil.copy2(src, dst)
+            except Exception as e:
+                log_line(log_path, f"Archive copy failed {src} -> {dst}: {e}")
+
+
+def prepare_tmp_frames(
+    archive_dir: Path,
+    tmp_dir: Path,
+    latest_token: str,
+    window_seconds: int,
+) -> int:
+    ensure_dir(tmp_dir)
+    for p in tmp_dir.iterdir():
+        if p.is_file():
+            try:
+                p.unlink()
+            except Exception:
+                pass
+
+    cutoff = time.time() - window_seconds
+    token = latest_token.lower()
+
+    records: List[Tuple[float, str]] = []
+    for p in archive_dir.iterdir():
+        if not p.is_file():
+            continue
+        name_lower = p.name.lower()
+        if not name_lower.endswith(".jpg"):
+            continue
+        if token not in name_lower:
+            continue
+        ts = parse_archive_ts(p.name)
+        if ts is None:
+            continue
+        if ts >= cutoff:
+            records.append((ts, p.name))
+
+    records.sort(key=lambda x: (x[0], x[1]))
+
+    count = 0
+    for idx, (_, fname) in enumerate(records, start=1):
+        src = archive_dir / fname
+        dst = tmp_dir / f"frame_{idx:05d}.jpg"
+        shutil.copy2(src, dst)
+        count += 1
+
+    return count
+
+
+def radar_archive_24h(config: Dict[str, Any], config_dir: Path, force: bool) -> int:
+    base_url = str(config["data"]["base_url"])
+    publish_cfg = config.get("publish", {}) or {}
+
+    pl = config["pipelines"]["radar_archive_24h"]
+    log_path = resolve_path(config_dir, pl["log_file"])
+    work_dir = resolve_path(config_dir, pl["work_dir"])
+
+    window_seconds = int(pl.get("window_seconds", 24 * 3600))
+    build_once = bool(pl.get("build_max_once_per_hour", True))
+    last_hour_file = resolve_path(config_dir, pl.get("last_built_hour_file", "./work/last_built_hour.txt"))
+
+    input_fps_24h = int(pl.get("input_fps_24h", 4))
+    output_fps_24h = int(pl.get("output_fps_24h", 10))
+
+    wide = pl["wide"]
+    zoom = pl["zoom"]
+
+    # Local frame dirs (latest snapshot)
+    wide_frames = work_dir / "wide_frames"
+    zoom_frames = work_dir / "zoom_frames"
+
+    # Archive dirs
+    wide_archive = work_dir / "wide_archive"
+    zoom_archive = work_dir / "zoom_archive"
+
+    # Tmp dirs for numbered frames
+    wide_tmp = work_dir / "wide_tmp"
+    zoom_tmp = work_dir / "zoom_tmp"
+
+    log_line(log_path, "radar-archive-24h start")
+    ensure_dir(work_dir)
+
+    # Download latest into frame dirs
+    download_sequence(
+        base_url, wide_frames,
+        str(wide["prefix"]), str(wide["ext"]), int(wide["slots"]),
+        log_path
+    )
+    download_sequence(
+        base_url, zoom_frames,
+        str(zoom["prefix"]), str(zoom["ext"]), int(zoom["slots"]),
+        log_path
+    )
+
+    # Snapshot into archive
+    archive_snapshot(wide_frames, wide_archive, str(wide["prefix"]), str(wide["ext"]), int(wide["slots"]), log_path)
+    archive_snapshot(zoom_frames, zoom_archive, str(zoom["prefix"]), str(zoom["ext"]), int(zoom["slots"]), log_path)
+
+    # Prune
+    prune_archive_dir(wide_archive, window_seconds, log_path)
+    prune_archive_dir(zoom_archive, window_seconds, log_path)
+
+    # Build gating
+    cur_hour = time.strftime("%Y%m%d_%H")
+    last = read_text(last_hour_file)
+
+    if build_once and (not force) and (cur_hour == last):
+        log_line(log_path, "Already built this hour; skipping MP4 rebuild.")
+        return 0
+
+    # Prepare tmp sequences
+    wide_count = prepare_tmp_frames(wide_archive, wide_tmp, str(wide["latest_token"]), window_seconds)
+    zoom_count = prepare_tmp_frames(zoom_archive, zoom_tmp, str(zoom["latest_token"]), window_seconds)
+
+    if wide_count < 2 and zoom_count < 2:
+        log_line(log_path, f"Not enough frames to build 24h MP4s (wide={wide_count}, zoom={zoom_count}).")
+        return 0
+
+    # Build MP4s from tmp frame_%05d.jpg
+    def build_from_tmp(tmp_dir: Path, out_file: Path, label: str) -> bool:
+        ensure_dir(out_file.parent)
+        pattern = str(tmp_dir / "frame_%05d.jpg")
+        vf = f"minterpolate=fps={output_fps_24h}:mi_mode=blend"
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-framerate", str(input_fps_24h),
+            "-i", pattern,
+            "-vf", vf,
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-pix_fmt", "yuv420p",
+            str(out_file),
+        ]
+        log_line(log_path, f"Running ffmpeg for {label}")
+        ok, out = run_cmd(cmd, log_path)
+        if ok:
+            log_line(log_path, f"Built: {out_file}")
+            return True
+        log_line(log_path, f"ffmpeg FAILED for {label}")
+        if out.strip():
+            log_line(log_path, out.strip())
+        return False
+
+    out_wide = resolve_path(config_dir, wide["out_file"])
+    out_zoom = resolve_path(config_dir, zoom["out_file"])
+
+    ok_wide = False
+    ok_zoom = False
+
+    if wide_count >= 2:
+        ok_wide = build_from_tmp(wide_tmp, out_wide, "WIDE 24h")
+    if zoom_count >= 2:
+        ok_zoom = build_from_tmp(zoom_tmp, out_zoom, "ZOOM 24h")
+
+    if ok_wide and str(wide.get("remote_target", "")).strip():
+        scp_upload(out_wide, str(wide["remote_target"]), publish_cfg, log_path)
+    if ok_zoom and str(zoom.get("remote_target", "")).strip():
+        scp_upload(out_zoom, str(zoom["remote_target"]), publish_cfg, log_path)
+
+    write_text(last_hour_file, cur_hour)
+    log_line(log_path, "radar-archive-24h done")
+    return 0
+
+
+def main() -> int:
+    ap = ArgumentParser(description="Jersey Met radar animator (radar only)")
+    ap.add_argument("--config", default="config.yaml", help="Path to YAML config file")
+    ap.add_argument("--force", action="store_true", help="Force rebuild even if unchanged / gated")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("radar-live", help="Build live radar MP4 loops")
+    sub.add_parser("radar-archive-24h", help="Maintain 24h archive and build 24h MP4s")
+
+    args = ap.parse_args()
+
+    cfg_path = Path(os.path.expanduser(args.config)).resolve()
+    cfg = load_yaml(cfg_path)
+    cfg_dir = cfg_path.parent
+
+    # Minimal validation
+    if "data" not in cfg or "base_url" not in cfg["data"]:
+        die("Config missing: data.base_url")
+    if "pipelines" not in cfg:
+        die("Config missing: pipelines")
+
+    if args.cmd == "radar-live":
+        if "radar_live" not in cfg["pipelines"]:
+            die("Config missing: pipelines.radar_live")
+        return radar_live(cfg, cfg_dir, force=bool(args.force))
+
+    if args.cmd == "radar-archive-24h":
+        if "radar_archive_24h" not in cfg["pipelines"]:
+            die("Config missing: pipelines.radar_archive_24h")
+        return radar_archive_24h(cfg, cfg_dir, force=bool(args.force))
+
+    die(f"Unknown command: {args.cmd}")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
